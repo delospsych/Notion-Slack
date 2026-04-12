@@ -18,7 +18,9 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -73,6 +75,11 @@ def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[
     with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
         charset = resp.headers.get_content_charset() or "utf-8"
         return json.loads(resp.read().decode(charset))
+
+
+def post_slack_response(response_url: str, text: str, response_type: str = "ephemeral") -> None:
+    payload = {"response_type": response_type, "text": text}
+    http_post_json(response_url, payload, headers={})
 
 
 def parse_rich_text(rich_text: list[dict[str, Any]]) -> str:
@@ -201,18 +208,30 @@ def fetch_notion_docs() -> list[NotionDoc]:
 
 
 def tokenize(value: str) -> set[str]:
-    return {tok for tok in re.findall(r"[a-zA-Z0-9]{3,}", value.lower())}
+    tokens = {tok for tok in re.findall(r"[a-zA-Z0-9]{3,}", value.lower())}
+    # Add compacted variant for terms that may be written with or without spaces
+    # (for example "ring central" vs "ringcentral").
+    compact = re.sub(r"[^a-zA-Z0-9]", "", value.lower())
+    if len(compact) >= 6:
+        tokens.add(compact)
+    return tokens
+
+
+def similarity_score(question: str, doc: NotionDoc) -> float:
+    haystack = f"{doc.title}\n{doc.text[:1200]}"
+    return SequenceMatcher(None, question.lower(), haystack.lower()).ratio()
 
 
 def top_matches(question: str, docs: list[NotionDoc], limit: int = MAX_DOCS_FOR_CONTEXT) -> list[NotionDoc]:
     q_tokens = tokenize(question)
-    scored: list[tuple[int, NotionDoc]] = []
+    scored: list[tuple[float, NotionDoc]] = []
 
     for doc in docs:
         d_tokens = tokenize(f"{doc.title}\n{doc.text}")
         overlap = len(q_tokens.intersection(d_tokens))
-        if overlap > 0:
-            scored.append((overlap, doc))
+        fuzzy = similarity_score(question, doc)
+        score = overlap + fuzzy
+        scored.append((score, doc))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [doc for _, doc in scored[:limit]]
@@ -227,7 +246,16 @@ def build_context(docs: list[NotionDoc]) -> str:
 
 
 def openai_answer(question: str, docs: list[NotionDoc]) -> str:
-    api_key = required_env("OPENAI_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        best = docs[0]
+        snippet = best.text[:600].strip()
+        return (
+            "I couldn't use the AI answer service because `OPENAI_API_KEY` is not configured.\n"
+            f"Closest SOP I found: *{best.title}*\n"
+            f"{snippet}\n\n"
+            f"Source: {best.url}"
+        )
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 
     context = build_context(docs)
@@ -332,6 +360,7 @@ class SlackHandler(BaseHTTPRequestHandler):
 
             form = parse_qs(raw_body.decode("utf-8"))
             question = (form.get("text", [""])[0] or "").strip()
+            response_url = (form.get("response_url", [""])[0] or "").strip()
             if not question:
                 self._respond_json(
                     {
@@ -341,24 +370,25 @@ class SlackHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            docs = CACHE.get_docs()
-            matches = top_matches(question, docs)
-            if not matches:
+            # If Slack sent a response_url, acknowledge quickly and answer async.
+            if response_url:
                 self._respond_json(
                     {
                         "response_type": "ephemeral",
-                        "text": "I couldn't find related SOPs in Notion for that question. Try different keywords.",
+                        "text": "Got it — searching your SOPs now...",
                     }
                 )
+                thread = threading.Thread(
+                    target=self._answer_and_respond,
+                    args=(question, response_url),
+                    daemon=True,
+                )
+                thread.start()
                 return
 
-            answer = openai_answer(question, matches)
-            self._respond_json(
-                {
-                    "response_type": "ephemeral",
-                    "text": answer,
-                }
-            )
+            # Fallback sync path if no response_url is available.
+            answer = self._build_answer(question)
+            self._respond_json({"response_type": "ephemeral", "text": answer})
         except ConfigError as err:
             self._respond_json(
                 {
@@ -374,6 +404,23 @@ class SlackHandler(BaseHTTPRequestHandler):
                     "text": f"Sorry, I hit an error: {err}",
                 },
                 status=500,
+            )
+
+    def _build_answer(self, question: str) -> str:
+        docs = CACHE.get_docs()
+        matches = top_matches(question, docs)
+        if not matches:
+            return "I couldn't find related SOPs in Notion for that question. Try different keywords."
+        return openai_answer(question, matches)
+
+    def _answer_and_respond(self, question: str, response_url: str) -> None:
+        try:
+            answer = self._build_answer(question)
+            post_slack_response(response_url, answer)
+        except Exception as err:  # noqa: BLE001
+            post_slack_response(
+                response_url,
+                f"Sorry, I hit an error while searching SOPs: {err}",
             )
 
 
