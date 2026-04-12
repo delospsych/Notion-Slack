@@ -1,3 +1,6 @@
+
+### `slack_notion_sop_bot.py`
+```python
 #!/usr/bin/env python3
 """Slack + Notion SOP Q&A bot.
 
@@ -30,6 +33,7 @@ from urllib.request import Request, urlopen
 NOTION_VERSION = "2022-06-28"
 NOTION_API_BASE = "https://api.notion.com/v1"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+BOT_VERSION = os.getenv("BOT_VERSION", "sop-bot-2026-04-12")
 
 CACHE_TTL_SECONDS = 600
 MAX_DOCS_FOR_CONTEXT = 5
@@ -78,7 +82,7 @@ def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[
 
 
 def post_slack_response(response_url: str, text: str, response_type: str = "ephemeral") -> None:
-    payload = {"response_type": response_type, "text": text}
+    payload = {"response_type": response_type, "text": f"[{BOT_VERSION}] {text}"}
     http_post_json(response_url, payload, headers={})
 
 
@@ -361,11 +365,22 @@ class SlackHandler(BaseHTTPRequestHandler):
             form = parse_qs(raw_body.decode("utf-8"))
             question = (form.get("text", [""])[0] or "").strip()
             response_url = (form.get("response_url", [""])[0] or "").strip()
+            user_name = (form.get("user_name", ["unknown"])[0] or "unknown").strip()
+            print(f"[{BOT_VERSION}] Slack command from '{user_name}': {question}")
             if not question:
                 self._respond_json(
                     {
                         "response_type": "ephemeral",
-                        "text": "Usage: /sop <your question>",
+                        "text": f"[{BOT_VERSION}] Usage: /sop <your question>",
+                    }
+                )
+                return
+
+            if question.lower() in {"ping", "health", "status"}:
+                self._respond_json(
+                    {
+                        "response_type": "ephemeral",
+                        "text": f"[{BOT_VERSION}] Online. Endpoint and signature verification are working.",
                     }
                 )
                 return
@@ -375,7 +390,7 @@ class SlackHandler(BaseHTTPRequestHandler):
                 self._respond_json(
                     {
                         "response_type": "ephemeral",
-                        "text": "Got it — searching your SOPs now...",
+                        "text": f"[{BOT_VERSION}] Got it — searching your SOPs now...",
                     }
                 )
                 thread = threading.Thread(
@@ -388,7 +403,7 @@ class SlackHandler(BaseHTTPRequestHandler):
 
             # Fallback sync path if no response_url is available.
             answer = self._build_answer(question)
-            self._respond_json({"response_type": "ephemeral", "text": answer})
+            self._respond_json({"response_type": "ephemeral", "text": f"[{BOT_VERSION}] {answer}"})
         except ConfigError as err:
             self._respond_json(
                 {
