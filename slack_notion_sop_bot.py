@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
-"""Slack + Notion SOP Q&A bot.
+"""Slack + Notion SOP Q&A bot for regular Notion pages.
 
 This bot is designed to back a Slack slash command (for example `/sop`).
 When a user asks a question in Slack, it:
 1) Verifies the Slack request signature.
-2) Pulls and indexes content from a Notion database.
+2) Crawls a parent Notion page and its child pages.
 3) Retrieves the most relevant SOP snippets.
 4) Uses OpenAI Responses API to generate an answer grounded in those snippets.
 
 No third-party packages are required.
+
+Required environment variables:
+- SLACK_SIGNING_SECRET
+- NOTION_API_KEY
+- NOTION_PARENT_PAGE_ID
+- OPENAI_API_KEY   (optional; bot can still return closest SOP without AI)
+
+Optional environment variables:
+- OPENAI_MODEL
+- BOT_VERSION
+- HOST
+- PORT
 """
 
 from __future__ import annotations
@@ -20,8 +32,8 @@ import os
 import re
 import threading
 import time
-from difflib import SequenceMatcher
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.error import HTTPError
@@ -36,6 +48,7 @@ BOT_VERSION = os.getenv("BOT_VERSION", "sop-bot-2026-04-12")
 CACHE_TTL_SECONDS = 600
 MAX_DOCS_FOR_CONTEXT = 5
 MAX_SNIPPET_CHARS = 1200
+MAX_RECURSION_DEPTH = 5
 
 
 @dataclass
@@ -66,7 +79,7 @@ def http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], t
     req_headers.update(headers)
     req = Request(url, data=json.dumps(payload).encode("utf-8"), headers=req_headers, method="POST")
     try:
-        with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
+        with urlopen(req, timeout=timeout) as resp:  # nosec B310
             charset = resp.headers.get_content_charset() or "utf-8"
             body = resp.read().decode(charset).strip()
             if not body:
@@ -85,7 +98,7 @@ def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[
     req_headers.update(headers)
     req = Request(url, headers=req_headers)
     try:
-        with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
+        with urlopen(req, timeout=timeout) as resp:  # nosec B310
             charset = resp.headers.get_content_charset() or "utf-8"
             body = resp.read().decode(charset).strip()
             if not body:
@@ -104,6 +117,13 @@ def post_slack_response(response_url: str, text: str, response_type: str = "ephe
     http_post_json(response_url, payload, headers={})
 
 
+def notion_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Notion-Version": NOTION_VERSION,
+    }
+
+
 def parse_rich_text(rich_text: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for rt in rich_text:
@@ -114,119 +134,173 @@ def parse_rich_text(rich_text: list[dict[str, Any]]) -> str:
     return "".join(parts).strip()
 
 
-def extract_page_text(page: dict[str, Any]) -> tuple[str, str]:
+def extract_title_from_page(page: dict[str, Any]) -> str:
     properties = page.get("properties", {})
-    title = "Untitled"
-    segments: list[str] = []
-
     if isinstance(properties, dict):
         for prop in properties.values():
             if not isinstance(prop, dict):
                 continue
-            ptype = prop.get("type")
-            if ptype == "title":
+            if prop.get("type") == "title":
                 t = parse_rich_text(prop.get("title", []))
                 if t:
-                    title = t
-                    segments.append(t)
-            elif ptype == "rich_text":
-                txt = parse_rich_text(prop.get("rich_text", []))
-                if txt:
-                    segments.append(txt)
-            elif ptype == "select":
-                sel = prop.get("select")
-                if isinstance(sel, dict) and isinstance(sel.get("name"), str):
-                    segments.append(sel["name"])
-            elif ptype == "multi_select":
-                items = prop.get("multi_select", [])
-                names = [x.get("name", "") for x in items if isinstance(x, dict)]
-                if names:
-                    segments.append(", ".join(n for n in names if n))
-            elif ptype == "number" and prop.get("number") is not None:
-                segments.append(str(prop["number"]))
+                    return t
 
-    return title, "\n".join(s for s in segments if s)
+    # Fallback for pages returned from block traversal contexts
+    title = page.get("child_page", {}).get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+
+    return "Untitled"
+
+
+def get_page(page_id: str, api_key: str) -> dict[str, Any]:
+    return http_get_json(f"{NOTION_API_BASE}/pages/{page_id}", headers=notion_headers(api_key))
+
+
+def get_block_children(block_id: str, api_key: str) -> list[dict[str, Any]]:
+    headers = notion_headers(api_key)
+    results: list[dict[str, Any]] = []
+    cursor: str | None = None
+
+    while True:
+        url = f"{NOTION_API_BASE}/blocks/{block_id}/children?page_size=100"
+        if cursor:
+            url += f"&start_cursor={cursor}"
+        payload = http_get_json(url, headers=headers)
+        batch = payload.get("results", [])
+        if isinstance(batch, list):
+            for item in batch:
+                if isinstance(item, dict):
+                    results.append(item)
+
+        if not payload.get("has_more"):
+            break
+        cursor = payload.get("next_cursor")
+        if not isinstance(cursor, str):
+            break
+
+    return results
 
 
 def extract_block_text(block: dict[str, Any]) -> str:
     btype = block.get("type")
     if not isinstance(btype, str):
         return ""
+
     block_data = block.get(btype, {})
     if not isinstance(block_data, dict):
         return ""
 
     rich = block_data.get("rich_text", [])
     if isinstance(rich, list):
-        return parse_rich_text(rich)
+        text = parse_rich_text(rich)
+        if text:
+            return text
+
+    # Some block types may store captions
+    caption = block_data.get("caption", [])
+    if isinstance(caption, list):
+        caption_text = parse_rich_text(caption)
+        if caption_text:
+            return caption_text
+
     return ""
 
 
-def fetch_page_blocks(notion_api_key: str, page_id: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {notion_api_key}",
-        "Notion-Version": NOTION_VERSION,
-    }
-    url = f"{NOTION_API_BASE}/blocks/{page_id}/children?page_size=100"
-    payload = http_get_json(url, headers=headers)
+def collect_page_content_and_children(page_id: str, api_key: str, depth: int = 0) -> tuple[str, list[str]]:
+    """Return (text_for_this_page, child_page_ids)."""
+    if depth > MAX_RECURSION_DEPTH:
+        return "", []
 
     lines: list[str] = []
-    for block in payload.get("results", []):
-        if isinstance(block, dict):
-            line = extract_block_text(block)
-            if line:
-                lines.append(line)
-    return "\n".join(lines)
+    child_page_ids: list[str] = []
+
+    blocks = get_block_children(page_id, api_key)
+
+    for block in blocks:
+        btype = block.get("type")
+
+        if btype == "child_page":
+            child_id = block.get("id", "")
+            if isinstance(child_id, str) and child_id:
+                child_page_ids.append(child_id)
+            continue
+
+        # Extract visible text from this block
+        text = extract_block_text(block)
+        if text:
+            lines.append(text)
+
+        # Recurse into nested blocks like toggles, headings with children, etc.
+        if block.get("has_children") is True:
+            block_id = block.get("id", "")
+            if isinstance(block_id, str) and block_id:
+                nested_text, nested_child_pages = collect_page_content_and_children(block_id, api_key, depth + 1)
+                if nested_text:
+                    lines.append(nested_text)
+                child_page_ids.extend(nested_child_pages)
+
+    seen: set[str] = set()
+    unique_child_ids: list[str] = []
+    for cid in child_page_ids:
+        if cid not in seen:
+            seen.add(cid)
+            unique_child_ids.append(cid)
+
+    return "\n".join(line for line in lines if line).strip(), unique_child_ids
 
 
 def fetch_notion_docs() -> list[NotionDoc]:
     notion_api_key = required_env("NOTION_API_KEY")
-    db_id = required_env("NOTION_DATABASE_ID")
-
-    headers = {
-        "Authorization": f"Bearer {notion_api_key}",
-        "Notion-Version": NOTION_VERSION,
-    }
+    parent_page_id = required_env("NOTION_PARENT_PAGE_ID")
 
     docs: list[NotionDoc] = []
-    cursor: str | None = None
-    while True:
-        body: dict[str, Any] = {"page_size": 50}
-        if cursor:
-            body["start_cursor"] = cursor
+    visited_page_ids: set[str] = set()
 
-        data = http_post_json(f"{NOTION_API_BASE}/databases/{db_id}/query", body, headers=headers)
-        for page in data.get("results", []):
-            if not isinstance(page, dict):
-                continue
-            page_id = page.get("id", "")
-            if not isinstance(page_id, str) or not page_id:
-                continue
+    def crawl_page(page_id: str, depth: int = 0) -> None:
+        if depth > MAX_RECURSION_DEPTH:
+            return
+        if page_id in visited_page_ids:
+            return
+        visited_page_ids.add(page_id)
 
-            title, prop_text = extract_page_text(page)
-            block_text = fetch_page_blocks(notion_api_key, page_id)
-            text = "\n".join(x for x in [prop_text, block_text] if x).strip()
-            if not text:
-                continue
+        page = get_page(page_id, notion_api_key)
+        title = extract_title_from_page(page)
+        url = page.get("url", "")
+        if not isinstance(url, str):
+            url = ""
 
+        body_text, child_page_ids = collect_page_content_and_children(page_id, notion_api_key, depth=depth)
+
+        text_parts = []
+        if title and title != "Untitled":
+            text_parts.append(title)
+        if body_text:
+            text_parts.append(body_text)
+        combined_text = "\n".join(text_parts).strip()
+
+        # Do not index the parent page if it has no meaningful text.
+        if combined_text:
             docs.append(
                 NotionDoc(
                     page_id=page_id,
                     title=title,
-                    url=page.get("url", ""),
-                    text=text,
+                    url=url,
+                    text=combined_text,
                 )
             )
 
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
-        if not isinstance(cursor, str):
-            break
+        for child_id in child_page_ids:
+            crawl_page(child_id, depth + 1)
 
-    if not docs:
-        raise BotError("No readable Notion pages were found in the configured database.")
-    return docs
+    crawl_page(parent_page_id)
+
+    # Remove parent page itself if it's just a container with almost no content
+    filtered_docs = [doc for doc in docs if len(doc.text.strip()) >= 20]
+
+    if not filtered_docs:
+        raise BotError("No readable Notion pages were found under the configured parent page.")
+    return filtered_docs
 
 
 def tokenize(value: str) -> set[str]:
@@ -276,6 +350,7 @@ def openai_answer(question: str, docs: list[NotionDoc]) -> str:
             f"{snippet}\n\n"
             f"Source: {best.url}"
         )
+
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 
     context = build_context(docs)
@@ -293,6 +368,7 @@ def openai_answer(question: str, docs: list[NotionDoc]) -> str:
             {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
         ],
     }
+
     response = http_post_json(
         OPENAI_RESPONSES_URL,
         payload,
@@ -312,6 +388,7 @@ def openai_answer(question: str, docs: list[NotionDoc]) -> str:
                 txt = content.get("text", "")
                 if isinstance(txt, str) and txt.strip():
                     chunks.append(txt.strip())
+
     text = "\n".join(chunks).strip()
     if not text:
         raw_text = response.get("raw_text")
@@ -330,6 +407,7 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str, signing_
         ts = int(timestamp)
     except ValueError:
         return False
+
     if abs(now - ts) > 60 * 5:
         return False
 
@@ -356,6 +434,23 @@ CACHE = NotionIndexCache()
 
 
 class SlackHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/" or self.path == "/health":
+            data = json.dumps({"ok": True, "version": BOT_VERSION}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        data = json.dumps({"ok": False, "error": "Not Found"}).encode("utf-8")
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _respond_json(self, payload: dict[str, Any], status: int = 200) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -385,6 +480,7 @@ class SlackHandler(BaseHTTPRequestHandler):
             response_url = (form.get("response_url", [""])[0] or "").strip()
             user_name = (form.get("user_name", ["unknown"])[0] or "unknown").strip()
             print(f"[{BOT_VERSION}] Slack command from '{user_name}': {question}")
+
             if not question:
                 self._respond_json(
                     {
@@ -420,6 +516,7 @@ class SlackHandler(BaseHTTPRequestHandler):
 
             answer = self._build_answer(question)
             self._respond_json({"response_type": "ephemeral", "text": f"[{BOT_VERSION}] {answer}"})
+
         except ConfigError as err:
             self._respond_json(
                 {
