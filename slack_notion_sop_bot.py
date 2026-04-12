@@ -1,6 +1,3 @@
-
-### `slack_notion_sop_bot.py`
-```python
 #!/usr/bin/env python3
 """Slack + Notion SOP Q&A bot.
 
