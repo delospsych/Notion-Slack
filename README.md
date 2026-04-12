@@ -104,3 +104,15 @@ Deploy as an HTTPS web service (Render, Fly.io, Railway, ECS, etc.) and point Sl
 
 - If `OPENAI_API_KEY` is missing, the bot returns best-match SOP snippets instead of an AI-generated answer.
 - For large SOP collections, consider vector/embedding retrieval for higher relevance.
+- Run `/sop ping` to confirm you are hitting this service; the bot replies with the configured `BOT_VERSION` marker.
+- If Slack still responds with `You said: ...`, your slash command Request URL is likely pointing to a different app/service than this repository.
+slack_notion_sop_bot.py
+slack_notion_sop_bot.py
+New
++449
+-0
+
+Large diff
+449 lines
+
+Load diff
