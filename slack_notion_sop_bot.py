@@ -24,6 +24,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import parse_qs
 from urllib.request import Request, urlopen
 
@@ -64,18 +65,26 @@ def http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], t
     req_headers = {"Content-Type": "application/json", "User-Agent": "slack-notion-sop-bot/1.0"}
     req_headers.update(headers)
     req = Request(url, data=json.dumps(payload).encode("utf-8"), headers=req_headers, method="POST")
-    with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return json.loads(resp.read().decode(charset))
+    try:
+        with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return json.loads(resp.read().decode(charset))
+    except HTTPError as err:
+        body = err.read().decode("utf-8", errors="replace")
+        raise BotError(f"POST {url} failed with HTTP {err.code}: {body[:500]}") from err
 
 
 def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[str, Any]:
     req_headers = {"User-Agent": "slack-notion-sop-bot/1.0"}
     req_headers.update(headers)
     req = Request(url, headers=req_headers)
-    with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return json.loads(resp.read().decode(charset))
+    try:
+        with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return json.loads(resp.read().decode(charset))
+    except HTTPError as err:
+        body = err.read().decode("utf-8", errors="replace")
+        raise BotError(f"GET {url} failed with HTTP {err.code}: {body[:500]}") from err
 
 
 def post_slack_response(response_url: str, text: str, response_type: str = "ephemeral") -> None:
