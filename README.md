@@ -1,101 +1,106 @@
-# Slack Automation Bots
+# Slack ↔ Notion SOP Assistant
 
-This repo now contains two standalone Slack bots:
+This project runs a Slack bot that answers team questions using SOPs and internal docs stored in a Notion database.
 
-1. **Daily Psychiatry Pearl Bot** (`daily_psych_pearl.py`)
-2. **Notion SOP Q&A Bot** (`slack_notion_sop_bot.py`)
+## What it does
 
----
+When a user runs a slash command like:
 
-## 1) Daily Psychiatry Pearl Bot (existing)
-
-Posts one psychiatry medication pearl per day to Slack.
-
-- Sources facts from openFDA labels
-- Optionally rewrites with OpenAI into clinician-friendly format
-- Delivers via Slack Incoming Webhook
-
-### Setup
-
-Add these environment variables/secrets:
-
-- `SLACK_WEBHOOK_URL` (required)
-- `OPENAI_API_KEY` (optional but recommended)
-- `OPENAI_MODEL` (optional, default `gpt-4.1-mini`)
-- `FORCE_MEDICATION` (optional, for testing)
-
-Run locally:
-
-```bash
-python daily_psych_pearl.py
+```text
+/sop How do I log in to RingCentral?
 ```
 
+the service:
+
+1. Verifies the Slack request signature.
+2. Pulls pages from your configured Notion database.
+3. Finds the most relevant SOP pages.
+4. Generates a grounded answer (OpenAI), or falls back to closest-SOP snippet if no OpenAI key is set.
+5. Responds in Slack (ephemeral/private response).
+
+The handler sends a quick ack first, then posts the full answer via Slack `response_url` to avoid timeouts.
+
 ---
 
-## 2) Notion SOP Q&A Bot (new)
+## Files
 
-This bot lets people in Slack ask operational questions and get answers from your Notion SOP database instead of pinging managers.
+- `slack_notion_sop_bot.py` — main Slack/Notion SOP Q&A service
 
-### How it works
+---
 
-1. User asks `/sop How do I handle a refund?` in Slack.
-2. Slack sends the command payload to this service.
-3. Service verifies Slack request signature.
-4. Service queries your Notion database, extracts page text, and finds the best matching SOP pages.
-5. Service asks OpenAI to answer using only those excerpts.
-6. Bot returns an **ephemeral** answer in Slack with doc references.
+## Requirements
 
-### Required environment variables
+- Python 3.10+
+- A Slack app with a slash command (for example `/sop`)
+- A Notion internal integration with access to your SOP database
+- OpenAI API key (optional but recommended)
 
-- `SLACK_SIGNING_SECRET` (from your Slack app)
-- `NOTION_API_KEY` (internal integration token)
-- `NOTION_DATABASE_ID` (the SOP database ID)
+No third-party Python packages are required.
+
+---
+
+## Environment variables
+
+Required:
+
+- `SLACK_SIGNING_SECRET`
+- `NOTION_API_KEY`
+- `NOTION_DATABASE_ID`
+
+Recommended:
+
 - `OPENAI_API_KEY`
 
 Optional:
 
-- `OPENAI_MODEL` (default `gpt-4.1-mini`)
-- `HOST` (default `0.0.0.0`)
-- `PORT` (default `8080`)
+- `OPENAI_MODEL` (default: `gpt-4.1-mini`)
+- `HOST` (default: `0.0.0.0`)
+- `PORT` (default: `8080`)
 
-### Slack app configuration
+---
+
+## Slack setup
 
 1. Create a Slack app.
-2. Add a Slash Command (for example `/sop`).
-3. Set Request URL to your hosted endpoint:
+2. Add a Slash Command (example: `/sop`).
+3. Set Request URL to:
    - `https://<your-domain>/slack/command`
-4. In **Basic Information**, copy the Signing Secret into `SLACK_SIGNING_SECRET`.
+4. Copy **Signing Secret** from Slack app settings into `SLACK_SIGNING_SECRET`.
+5. Install/reinstall app to your workspace.
 
-### Notion configuration
+---
 
-1. Create an internal Notion integration and copy its token to `NOTION_API_KEY`.
+## Notion setup
+
+1. Create a Notion internal integration and copy token to `NOTION_API_KEY`.
 2. Share your SOP database with that integration.
-3. Copy the database ID into `NOTION_DATABASE_ID`.
+3. Copy database ID to `NOTION_DATABASE_ID`.
 
-### Run locally
+---
+
+## Run locally
 
 ```bash
 export SLACK_SIGNING_SECRET="..."
 export NOTION_API_KEY="secret_..."
 export NOTION_DATABASE_ID="..."
-export OPENAI_API_KEY="sk-..."
+export OPENAI_API_KEY="sk-..." # optional
 python slack_notion_sop_bot.py
 ```
 
-Server listens on:
+Service endpoint:
 
 - `POST /slack/command`
 
-### Deployment notes
+---
 
-- Host this as a small web service (Render/Fly.io/Railway/AWS ECS/etc).
-- Use HTTPS (required by Slack).
-- If your SOP set is large, move retrieval to embeddings/vector search for better precision.
+## Deploy
+
+Deploy as an HTTPS web service (Render, Fly.io, Railway, ECS, etc.) and point Slack slash command URL to your deployed `/slack/command` endpoint.
 
 ---
 
-## Safety / compliance note
+## Notes
 
-- For internal knowledge assistance only.
-- Keep human review in place for high-risk decisions (legal/HR/security/medical/financial).
-- Restrict Notion integration access to only the databases the bot truly needs.
+- If `OPENAI_API_KEY` is missing, the bot returns best-match SOP snippets instead of an AI-generated answer.
+- For large SOP collections, consider vector/embedding retrieval for higher relevance.
