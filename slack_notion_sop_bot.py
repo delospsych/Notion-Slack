@@ -68,10 +68,16 @@ def http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], t
     try:
         with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
             charset = resp.headers.get_content_charset() or "utf-8"
-            return json.loads(resp.read().decode(charset))
+            body = resp.read().decode(charset).strip()
+            if not body:
+                return {}
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                return {"raw_text": body}
     except HTTPError as err:
         body = err.read().decode("utf-8", errors="replace")
-        raise BotError(f"POST {url} failed with HTTP {err.code}: {body[:500]}") from err
+        raise BotError(f"POST {url} failed with HTTP {err.code}: {body[:1000]}") from err
 
 
 def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[str, Any]:
@@ -81,10 +87,16 @@ def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[
     try:
         with urlopen(req, timeout=timeout) as resp:  # nosec B310 - expected HTTPS API URL
             charset = resp.headers.get_content_charset() or "utf-8"
-            return json.loads(resp.read().decode(charset))
+            body = resp.read().decode(charset).strip()
+            if not body:
+                return {}
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                return {"raw_text": body}
     except HTTPError as err:
         body = err.read().decode("utf-8", errors="replace")
-        raise BotError(f"GET {url} failed with HTTP {err.code}: {body[:500]}") from err
+        raise BotError(f"GET {url} failed with HTTP {err.code}: {body[:1000]}") from err
 
 
 def post_slack_response(response_url: str, text: str, response_type: str = "ephemeral") -> None:
@@ -219,8 +231,6 @@ def fetch_notion_docs() -> list[NotionDoc]:
 
 def tokenize(value: str) -> set[str]:
     tokens = {tok for tok in re.findall(r"[a-zA-Z0-9]{3,}", value.lower())}
-    # Add compacted variant for terms that may be written with or without spaces
-    # (for example "ring central" vs "ringcentral").
     compact = re.sub(r"[^a-zA-Z0-9]", "", value.lower())
     if len(compact) >= 6:
         tokens.add(compact)
@@ -304,6 +314,9 @@ def openai_answer(question: str, docs: list[NotionDoc]) -> str:
                     chunks.append(txt.strip())
     text = "\n".join(chunks).strip()
     if not text:
+        raw_text = response.get("raw_text")
+        if isinstance(raw_text, str) and raw_text.strip():
+            return raw_text.strip()
         raise BotError("OpenAI did not return an answer.")
     return text
 
@@ -312,7 +325,6 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str, signing_
     if not timestamp or not signature:
         return False
 
-    # Reject stale requests (> 5 min)
     now = int(time.time())
     try:
         ts = int(timestamp)
@@ -391,7 +403,6 @@ class SlackHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            # If Slack sent a response_url, acknowledge quickly and answer async.
             if response_url:
                 self._respond_json(
                     {
@@ -407,7 +418,6 @@ class SlackHandler(BaseHTTPRequestHandler):
                 thread.start()
                 return
 
-            # Fallback sync path if no response_url is available.
             answer = self._build_answer(question)
             self._respond_json({"response_type": "ephemeral", "text": f"[{BOT_VERSION}] {answer}"})
         except ConfigError as err:
@@ -439,10 +449,14 @@ class SlackHandler(BaseHTTPRequestHandler):
             answer = self._build_answer(question)
             post_slack_response(response_url, answer)
         except Exception as err:  # noqa: BLE001
-            post_slack_response(
-                response_url,
-                f"Sorry, I hit an error while searching SOPs: {err}",
-            )
+            try:
+                post_slack_response(
+                    response_url,
+                    f"Sorry, I hit an error while searching SOPs: {err}",
+                )
+            except Exception as post_err:  # noqa: BLE001
+                print(f"[{BOT_VERSION}] Failed to post Slack error response: {post_err}")
+                print(f"[{BOT_VERSION}] Original async error: {err}")
 
 
 def main() -> None:
