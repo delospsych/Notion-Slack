@@ -106,3 +106,4 @@ Deploy as an HTTPS web service (Render, Fly.io, Railway, ECS, etc.) and point Sl
 - For large SOP collections, consider vector/embedding retrieval for higher relevance.
 - Run `/sop ping` to confirm you are hitting this service; the bot replies with the configured `BOT_VERSION` marker.
 - If Slack still responds with `You said: ...`, your slash command Request URL is likely pointing to a different app/service than this repository.
+- If you get `HTTP Error 400: Bad Request`, check these first: `NOTION_DATABASE_ID` format, whether the Notion integration is shared to that database, and whether your `OPENAI_API_KEY`/`OPENAI_MODEL` are valid.
