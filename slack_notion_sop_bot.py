@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
-"""Slack + Notion SOP Q&A bot for regular Notion pages.
+"""Slack + Notion SOP Q&A bot with chunk-based retrieval.
 
-This bot is designed to back a Slack slash command (for example `/sop`).
+This bot is designed to back a Slack slash command (for example `/help`).
 When a user asks a question in Slack, it:
 1) Verifies the Slack request signature.
 2) Crawls one or more parent Notion pages and their child pages.
-3) Retrieves the most relevant SOP snippets.
-4) Uses OpenAI Responses API to generate an answer grounded in those snippets.
+3) Indexes page content into retrieval chunks.
+4) Retrieves the most relevant chunks across all SOPs.
+5) Uses OpenAI Responses API to generate an answer grounded in those chunks.
+
+Required environment variables:
+- SLACK_SIGNING_SECRET
+- NOTION_API_KEY
+- NOTION_PARENT_PAGE_IDS   (comma-separated page IDs)
+
+Optional environment variables:
+- OPENAI_API_KEY
+- OPENAI_MODEL
+- BOT_VERSION
+- HOST
+- PORT
 """
 
 from __future__ import annotations
@@ -16,9 +29,9 @@ import hmac
 import json
 import os
 import re
+import socket
 import threading
 import time
-import socket
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -32,16 +45,30 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 BOT_VERSION = os.getenv("BOT_VERSION", "sop-bot-2026-04-12")
 
+# Speed / retrieval tuning
 CACHE_TTL_SECONDS = 86400
-MAX_DOCS_FOR_CONTEXT = 6
-MAX_SNIPPET_CHARS = 1800
-MAX_RECURSION_DEPTH = 1
-MAX_DIRECT_HIT_SNIPPETS = 2
 HTTP_TIMEOUT_SECONDS = 45
+PAGE_RECURSION_DEPTH = 2
+BLOCK_RECURSION_DEPTH = 1
+
+# Chunk retrieval tuning
+CHUNK_TARGET_CHARS = 900
+CHUNK_OVERLAP_LINES = 2
+MAX_CHUNKS_FOR_CONTEXT = 12
+MAX_CHARS_PER_CHUNK = 1400
 
 
 @dataclass
 class NotionDoc:
+    page_id: str
+    title: str
+    url: str
+    text: str
+
+
+@dataclass
+class Chunk:
+    chunk_id: str
     page_id: str
     title: str
     url: str
@@ -174,6 +201,18 @@ def get_block_children(block_id: str, api_key: str) -> list[dict[str, Any]]:
     return results
 
 
+def block_prefix(block_type: str) -> str:
+    if block_type in {"bulleted_list_item", "to_do"}:
+        return "- "
+    if block_type == "numbered_list_item":
+        return "1. "
+    if block_type.startswith("heading_"):
+        return "## "
+    if block_type == "quote":
+        return "> "
+    return ""
+
+
 def extract_block_text(block: dict[str, Any]) -> str:
     btype = block.get("type")
     if not isinstance(btype, str):
@@ -183,28 +222,29 @@ def extract_block_text(block: dict[str, Any]) -> str:
     if not isinstance(block_data, dict):
         return ""
 
+    text = ""
     rich = block_data.get("rich_text", [])
     if isinstance(rich, list):
         text = parse_rich_text(rich)
-        if text:
-            return text
 
-    caption = block_data.get("caption", [])
-    if isinstance(caption, list):
-        caption_text = parse_rich_text(caption)
-        if caption_text:
-            return caption_text
+    if not text:
+        caption = block_data.get("caption", [])
+        if isinstance(caption, list):
+            text = parse_rich_text(caption)
 
-    return ""
+    if not text:
+        return ""
+
+    prefix = block_prefix(btype)
+    return f"{prefix}{text}".strip()
 
 
-def collect_page_content_and_children(page_id: str, api_key: str, depth: int = 0) -> tuple[str, list[str]]:
-    if depth > MAX_RECURSION_DEPTH:
-        return "", []
+def collect_page_content_and_children(page_id: str, api_key: str, block_depth: int = 0) -> tuple[list[str], list[str]]:
+    if block_depth > BLOCK_RECURSION_DEPTH:
+        return [], []
 
     lines: list[str] = []
     child_page_ids: list[str] = []
-
     blocks = get_block_children(page_id, api_key)
 
     for block in blocks:
@@ -214,18 +254,20 @@ def collect_page_content_and_children(page_id: str, api_key: str, depth: int = 0
             child_id = block.get("id", "")
             if isinstance(child_id, str) and child_id:
                 child_page_ids.append(child_id)
+            title = block.get("child_page", {}).get("title", "")
+            if isinstance(title, str) and title.strip():
+                lines.append(f"## {title.strip()}")
             continue
 
         text = extract_block_text(block)
         if text:
             lines.append(text)
 
-        if block.get("has_children") is True and depth < MAX_RECURSION_DEPTH:
+        if block.get("has_children") is True and block_depth < BLOCK_RECURSION_DEPTH:
             block_id = block.get("id", "")
             if isinstance(block_id, str) and block_id:
-                nested_text, nested_child_pages = collect_page_content_and_children(block_id, api_key, depth + 1)
-                if nested_text:
-                    lines.append(nested_text)
+                nested_lines, nested_child_pages = collect_page_content_and_children(block_id, api_key, block_depth + 1)
+                lines.extend(nested_lines)
                 child_page_ids.extend(nested_child_pages)
 
     seen: set[str] = set()
@@ -235,19 +277,65 @@ def collect_page_content_and_children(page_id: str, api_key: str, depth: int = 0
             seen.add(cid)
             unique_child_ids.append(cid)
 
-    return "\n".join(line for line in lines if line).strip(), unique_child_ids
+    return lines, unique_child_ids
 
 
-def fetch_notion_docs() -> list[NotionDoc]:
+def chunk_lines(title: str, url: str, page_id: str, lines: list[str]) -> list[Chunk]:
+    if not lines:
+        return []
+
+    cleaned = [line.strip() for line in lines if line and line.strip()]
+    if not cleaned:
+        return []
+
+    chunks: list[Chunk] = []
+    current: list[str] = []
+    current_chars = 0
+    chunk_index = 1
+
+    def flush_chunk() -> None:
+        nonlocal current, current_chars, chunk_index
+        if not current:
+            return
+        text = "\n".join(current).strip()
+        if text:
+            chunks.append(
+                Chunk(
+                    chunk_id=f"{page_id}:{chunk_index}",
+                    page_id=page_id,
+                    title=title,
+                    url=url,
+                    text=text[:MAX_CHARS_PER_CHUNK],
+                )
+            )
+            chunk_index += 1
+
+    for line in cleaned:
+        line_len = len(line) + 1
+        if current and current_chars + line_len > CHUNK_TARGET_CHARS:
+            flush_chunk()
+            overlap = current[-CHUNK_OVERLAP_LINES:] if CHUNK_OVERLAP_LINES > 0 else []
+            current = overlap[:]
+            current_chars = sum(len(x) + 1 for x in current)
+
+        current.append(line)
+        current_chars += line_len
+
+    flush_chunk()
+    return chunks
+
+
+def fetch_notion_docs() -> tuple[list[NotionDoc], list[Chunk]]:
     notion_api_key = required_env("NOTION_API_KEY")
     parent_page_ids_raw = required_env("NOTION_PARENT_PAGE_IDS")
     parent_page_ids = [x.strip() for x in parent_page_ids_raw.split(",") if x.strip()]
 
     docs: list[NotionDoc] = []
+    chunks: list[Chunk] = []
     visited_page_ids: set[str] = set()
 
-    def crawl_page(page_id: str, depth: int = 0) -> None:
-        if depth > MAX_RECURSION_DEPTH:
+    def crawl_page(page_id: str, page_depth: int = 0) -> None:
+        if page_depth > PAGE_RECURSION_DEPTH:
             return
         if page_id in visited_page_ids:
             return
@@ -259,16 +347,15 @@ def fetch_notion_docs() -> list[NotionDoc]:
         if not isinstance(url, str):
             url = ""
 
-        body_text, child_page_ids = collect_page_content_and_children(page_id, notion_api_key, depth=depth)
+        body_lines, child_page_ids = collect_page_content_and_children(page_id, notion_api_key, block_depth=0)
 
         text_parts = []
         if title and title != "Untitled":
             text_parts.append(title)
-        if body_text:
-            text_parts.append(body_text)
-        combined_text = "\n".join(text_parts).strip()
+        text_parts.extend(body_lines)
+        combined_text = "\n".join(x for x in text_parts if x).strip()
 
-        if combined_text:
+        if combined_text and len(combined_text) >= 20:
             docs.append(
                 NotionDoc(
                     page_id=page_id,
@@ -277,19 +364,19 @@ def fetch_notion_docs() -> list[NotionDoc]:
                     text=combined_text,
                 )
             )
+            chunks.extend(chunk_lines(title=title, url=url, page_id=page_id, lines=text_parts))
 
-        if depth < MAX_RECURSION_DEPTH:
+        if page_depth < PAGE_RECURSION_DEPTH:
             for child_id in child_page_ids:
-                crawl_page(child_id, depth + 1)
+                crawl_page(child_id, page_depth + 1)
 
     for parent_page_id in parent_page_ids:
-        crawl_page(parent_page_id)
+        crawl_page(parent_page_id, 0)
 
-    filtered_docs = [doc for doc in docs if len(doc.text.strip()) >= 20]
-
-    if not filtered_docs:
+    if not docs or not chunks:
         raise BotError("No readable Notion pages were found under the configured parent pages.")
-    return filtered_docs
+
+    return docs, chunks
 
 
 def tokenize(value: str) -> set[str]:
@@ -298,11 +385,6 @@ def tokenize(value: str) -> set[str]:
     if len(compact) >= 6:
         tokens.add(compact)
     return tokens
-
-
-def split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
-    return [p.strip() for p in parts if p and p.strip()]
 
 
 def extract_query_phrases(question: str) -> list[str]:
@@ -320,7 +402,7 @@ def extract_query_phrases(question: str) -> list[str]:
 
     words = re.findall(r"[a-zA-Z0-9]{3,}", lowered)
     if len(words) >= 2:
-        phrases.append(" ".join(words[: min(len(words), 8)]))
+        phrases.append(" ".join(words[: min(len(words), 10)]))
 
     seen: set[str] = set()
     unique: list[str] = []
@@ -331,139 +413,104 @@ def extract_query_phrases(question: str) -> list[str]:
     return unique
 
 
-def direct_hit_score(question: str, doc: NotionDoc) -> float:
+def chunk_score(question: str, chunk: Chunk) -> float:
     q = question.lower().strip()
-    hay = f"{doc.title}\n{doc.text}".lower()
+    hay = f"{chunk.title}\n{chunk.text}".lower()
+    q_tokens = tokenize(question)
+    h_tokens = tokenize(hay)
+
+    overlap = len(q_tokens.intersection(h_tokens))
+    coverage = overlap / max(len(q_tokens), 1) if q_tokens else 0.0
+
     score = 0.0
+    score += overlap * 2.5
+    score += coverage * 20.0
 
     if q and q in hay:
-        score += 25.0
+        score += 30.0
 
     for phrase in extract_query_phrases(question):
         if phrase in hay:
-            score += 10.0
+            score += 12.0
 
-    q_tokens = tokenize(question)
-    d_tokens = tokenize(hay)
-    overlap = len(q_tokens.intersection(d_tokens))
-    score += overlap * 1.5
+    if question.lower() in chunk.title.lower():
+        score += 10.0
 
-    if q_tokens:
-        coverage = overlap / max(len(q_tokens), 1)
-        score += coverage * 10.0
-
-    score += SequenceMatcher(None, q, hay[:2500]).ratio() * 4.0
-    if question.lower() in doc.title.lower():
-        score += 8.0
-
+    score += SequenceMatcher(None, q, hay[:3000]).ratio() * 6.0
     return score
 
 
-def top_matches(question: str, docs: list[NotionDoc], limit: int = MAX_DOCS_FOR_CONTEXT) -> list[NotionDoc]:
-    scored = [(direct_hit_score(question, doc), doc) for doc in docs]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in scored[:limit]]
-
-
-def best_matching_snippets(question: str, doc: NotionDoc, max_snippets: int = MAX_DIRECT_HIT_SNIPPETS) -> list[str]:
-    pieces = split_sentences(doc.text)
-    if not pieces:
-        return [doc.text[:MAX_SNIPPET_CHARS]]
-
-    q_tokens = tokenize(question)
-    scored: list[tuple[float, str]] = []
-
-    for piece in pieces:
-        piece_lower = piece.lower()
-        piece_tokens = tokenize(piece)
-        overlap = len(q_tokens.intersection(piece_tokens))
-        score = overlap * 2.0
-
-        for phrase in extract_query_phrases(question):
-            if phrase in piece_lower:
-                score += 8.0
-
-        score += SequenceMatcher(None, question.lower(), piece_lower).ratio() * 2.5
-
-        if score > 0:
-            scored.append((score, piece))
-
-    if not scored:
-        return [doc.text[:MAX_SNIPPET_CHARS]]
-
+def top_chunks(question: str, chunks: list[Chunk], limit: int = MAX_CHUNKS_FOR_CONTEXT) -> list[Chunk]:
+    scored = [(chunk_score(question, chunk), chunk) for chunk in chunks]
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    selected: list[str] = []
-    total_chars = 0
-    for _, piece in scored[: max_snippets * 3]:
-        if piece in selected:
+    selected: list[Chunk] = []
+    seen_chunk_ids: set[str] = set()
+
+    for _, chunk in scored:
+        if chunk.chunk_id in seen_chunk_ids:
             continue
-        if total_chars + len(piece) > MAX_SNIPPET_CHARS:
-            break
-        selected.append(piece)
-        total_chars += len(piece)
-        if len(selected) >= max_snippets:
+        selected.append(chunk)
+        seen_chunk_ids.add(chunk.chunk_id)
+        if len(selected) >= limit:
             break
 
-    return selected or [doc.text[:MAX_SNIPPET_CHARS]]
+    return selected
 
 
-def build_context(question: str, docs: list[NotionDoc]) -> str:
-    chunks = []
-    for idx, doc in enumerate(docs, start=1):
-        snippet = "\n".join(best_matching_snippets(question, doc))
-        snippet = snippet[:MAX_SNIPPET_CHARS]
-        chunks.append(f"[Doc {idx}] {doc.title}\nURL: {doc.url}\n{snippet}")
-    return "\n\n".join(chunks)
+def build_context(question: str, chunks: list[Chunk]) -> str:
+    best = top_chunks(question, chunks)
+    context_blocks = []
 
-
-def maybe_answer_from_direct_hit(question: str, docs: list[NotionDoc]) -> str | None:
-    if not docs:
-        return None
-
-    best = docs[0]
-    best_score = direct_hit_score(question, best)
-    if best_score < 18:
-        return None
-
-    snippets = best_matching_snippets(question, best, max_snippets=2)
-    if not snippets:
-        return None
-
-    snippet_text = "\n".join(f"- {s}" for s in snippets[:2])
-    return (
-        f"I found a likely direct match in *{best.title}*.\n"
-        f"{snippet_text}\n\n"
-        f"Source: {best.url}"
-    )
-
-
-def openai_answer(question: str, docs: list[NotionDoc]) -> str:
-    direct_answer = maybe_answer_from_direct_hit(question, docs)
-    if direct_answer and len(question.split()) <= 8:
-        return direct_answer
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        best = docs[0]
-        snippet = "\n".join(best_matching_snippets(question, best))[:800].strip()
-        return (
-            "I couldn't use the AI answer service because `OPENAI_API_KEY` is not configured.\n"
-            f"Closest SOP I found: *{best.title}*\n"
-            f"{snippet}\n\n"
-            f"Source: {best.url}"
+    for idx, chunk in enumerate(best, start=1):
+        context_blocks.append(
+            f"[Source {idx}] {chunk.title}\n"
+            f"URL: {chunk.url}\n"
+            f"{chunk.text}"
         )
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    return "\n\n".join(context_blocks)
 
-    context = build_context(question, docs)
+
+def fallback_answer_without_openai(question: str, chunks: list[Chunk]) -> str:
+    best = top_chunks(question, chunks, limit=5)
+    if not best:
+        return "I couldn't find related SOP content for that question."
+
+    lines = ["I found these likely relevant SOP excerpts:"]
+    for chunk in best:
+        lines.append(f"- *{chunk.title}*: {chunk.text[:300].strip()}...")
+        if chunk.url:
+            lines.append(f"  Source: {chunk.url}")
+    return "\n".join(lines)
+
+
+def openai_answer(question: str, chunks: list[Chunk]) -> str:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return fallback_answer_without_openai(question, chunks)
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1").strip() or "gpt-4.1"
+    context = build_context(question, chunks)
+
     system_prompt = (
-        "You are an internal SOP assistant. Answer using only the provided Notion excerpts. "
-        "Do not invent policy details. If the excerpts are incomplete, say that clearly. "
-        "Prefer exact operational instructions when present. "
-        "Use concise Slack-friendly markdown and include source doc numbers in brackets like [Doc 2]."
+        "You are an internal SOP assistant. Answer ONLY from the provided source excerpts. "
+        "Your job is to extract operational details thoroughly, not to be overly cautious. "
+        "If a list of forms, exclusions, steps, or requirements appears in the excerpts, enumerate all of them clearly. "
+        "Synthesize across multiple sources when needed. "
+        "Be concise but complete. "
+        "Use Slack-friendly markdown. "
+        "Start with the direct answer. "
+        "Then include important nuance or exceptions if present. "
+        "End with a short 'Sources:' section using the source labels like [Source 2]. "
+        "If the excerpts are genuinely insufficient, say exactly what is missing."
     )
-    user_prompt = f"Question: {question}\n\nNotion context:\n{context}"
+
+    user_prompt = (
+        f"Question: {question}\n\n"
+        f"Retrieved SOP excerpts:\n{context}\n\n"
+        "Answer the question as completely as possible from these excerpts."
+    )
 
     payload = {
         "model": model,
@@ -483,7 +530,7 @@ def openai_answer(question: str, docs: list[NotionDoc]) -> str:
     if isinstance(direct, str) and direct.strip():
         return direct.strip()
 
-    chunks: list[str] = []
+    chunks_out: list[str] = []
     for item in response.get("output", []):
         if not isinstance(item, dict):
             continue
@@ -491,9 +538,9 @@ def openai_answer(question: str, docs: list[NotionDoc]) -> str:
             if isinstance(content, dict) and content.get("type") == "output_text":
                 txt = content.get("text", "")
                 if isinstance(txt, str) and txt.strip():
-                    chunks.append(txt.strip())
+                    chunks_out.append(txt.strip())
 
-    text = "\n".join(chunks).strip()
+    text = "\n".join(chunks_out).strip()
     if not text:
         raw_text = response.get("raw_text")
         if isinstance(raw_text, str) and raw_text.strip():
@@ -524,14 +571,19 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str, signing_
 class NotionIndexCache:
     def __init__(self) -> None:
         self.docs: list[NotionDoc] = []
+        self.chunks: list[Chunk] = []
         self.loaded_at: float = 0.0
 
-    def get_docs(self) -> list[NotionDoc]:
-        if self.docs and (time.time() - self.loaded_at) < CACHE_TTL_SECONDS:
-            return self.docs
-        self.docs = fetch_notion_docs()
+    def get_index(self) -> tuple[list[NotionDoc], list[Chunk]]:
+        if self.docs and self.chunks and (time.time() - self.loaded_at) < CACHE_TTL_SECONDS:
+            return self.docs, self.chunks
+
+        docs, chunks = fetch_notion_docs()
+        self.docs = docs
+        self.chunks = chunks
         self.loaded_at = time.time()
-        return self.docs
+        print(f"[{BOT_VERSION}] Indexed {len(docs)} docs into {len(chunks)} chunks.")
+        return self.docs, self.chunks
 
 
 CACHE = NotionIndexCache()
@@ -589,7 +641,7 @@ class SlackHandler(BaseHTTPRequestHandler):
                 self._respond_json(
                     {
                         "response_type": "ephemeral",
-                        "text": f"[{BOT_VERSION}] Usage: /sop <your question>",
+                        "text": f"[{BOT_VERSION}] Usage: /help <your question>",
                     }
                 )
                 return
@@ -607,7 +659,7 @@ class SlackHandler(BaseHTTPRequestHandler):
                 self._respond_json(
                     {
                         "response_type": "ephemeral",
-                        "text": f"[{BOT_VERSION}] Got it — searching your SOPs now...",
+                        "text": f"[{BOT_VERSION}] Got it — searching SOPs now...",
                     }
                 )
                 thread = threading.Thread(
@@ -639,11 +691,8 @@ class SlackHandler(BaseHTTPRequestHandler):
             )
 
     def _build_answer(self, question: str) -> str:
-        docs = CACHE.get_docs()
-        matches = top_matches(question, docs)
-        if not matches:
-            return "I couldn't find related SOPs in Notion for that question. Try different keywords."
-        return openai_answer(question, matches)
+        _, chunks = CACHE.get_index()
+        return openai_answer(question, chunks)
 
     def _answer_and_respond(self, question: str, response_url: str) -> None:
         try:
@@ -668,11 +717,11 @@ def main() -> None:
     print(f"Listening on http://{host}:{port}/slack/command")
 
     try:
-        print(f"[{BOT_VERSION}] Preloading Notion docs into cache...")
-        CACHE.get_docs()
-        print(f"[{BOT_VERSION}] Cache loaded successfully.")
+        print(f"[{BOT_VERSION}] Preloading Notion index...")
+        CACHE.get_index()
+        print(f"[{BOT_VERSION}] Notion index loaded successfully.")
     except Exception as err:
-        print(f"[{BOT_VERSION}] Cache preload failed: {err}")
+        print(f"[{BOT_VERSION}] Notion index preload failed: {err}")
 
     server.serve_forever()
 
