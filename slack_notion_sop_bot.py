@@ -112,7 +112,7 @@ def post_slack_response(response_url: str, text: str, response_type: str = "ephe
 
 def notion_headers(api_key: str) -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {notion_api_key}",
+        "Authorization": f"Bearer {api_key}",
         "Notion-Version": NOTION_VERSION,
     }
 
