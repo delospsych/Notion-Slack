@@ -32,12 +32,12 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 BOT_VERSION = os.getenv("BOT_VERSION", "sop-bot-2026-04-12")
 
-CACHE_TTL_SECONDS = 21600
-MAX_DOCS_FOR_CONTEXT = 8
-MAX_SNIPPET_CHARS = 2500
-MAX_RECURSION_DEPTH = 3
-MAX_DIRECT_HIT_SNIPPETS = 3
-HTTP_TIMEOUT_SECONDS = 90
+CACHE_TTL_SECONDS = 86400
+MAX_DOCS_FOR_CONTEXT = 6
+MAX_SNIPPET_CHARS = 1800
+MAX_RECURSION_DEPTH = 1
+MAX_DIRECT_HIT_SNIPPETS = 2
+HTTP_TIMEOUT_SECONDS = 45
 
 
 @dataclass
@@ -112,7 +112,7 @@ def post_slack_response(response_url: str, text: str, response_type: str = "ephe
 
 def notion_headers(api_key: str) -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {notion_api_key}",
         "Notion-Version": NOTION_VERSION,
     }
 
@@ -220,7 +220,7 @@ def collect_page_content_and_children(page_id: str, api_key: str, depth: int = 0
         if text:
             lines.append(text)
 
-        if block.get("has_children") is True:
+        if block.get("has_children") is True and depth < MAX_RECURSION_DEPTH:
             block_id = block.get("id", "")
             if isinstance(block_id, str) and block_id:
                 nested_text, nested_child_pages = collect_page_content_and_children(block_id, api_key, depth + 1)
@@ -278,8 +278,9 @@ def fetch_notion_docs() -> list[NotionDoc]:
                 )
             )
 
-        for child_id in child_page_ids:
-            crawl_page(child_id, depth + 1)
+        if depth < MAX_RECURSION_DEPTH:
+            for child_id in child_page_ids:
+                crawl_page(child_id, depth + 1)
 
     for parent_page_id in parent_page_ids:
         crawl_page(parent_page_id)
@@ -351,7 +352,7 @@ def direct_hit_score(question: str, doc: NotionDoc) -> float:
         coverage = overlap / max(len(q_tokens), 1)
         score += coverage * 10.0
 
-    score += SequenceMatcher(None, q, hay[:4000]).ratio() * 5.0
+    score += SequenceMatcher(None, q, hay[:2500]).ratio() * 4.0
     if question.lower() in doc.title.lower():
         score += 8.0
 
@@ -382,7 +383,7 @@ def best_matching_snippets(question: str, doc: NotionDoc, max_snippets: int = MA
             if phrase in piece_lower:
                 score += 8.0
 
-        score += SequenceMatcher(None, question.lower(), piece_lower).ratio() * 3.0
+        score += SequenceMatcher(None, question.lower(), piece_lower).ratio() * 2.5
 
         if score > 0:
             scored.append((score, piece))
@@ -425,11 +426,11 @@ def maybe_answer_from_direct_hit(question: str, docs: list[NotionDoc]) -> str | 
     if best_score < 18:
         return None
 
-    snippets = best_matching_snippets(question, best, max_snippets=3)
+    snippets = best_matching_snippets(question, best, max_snippets=2)
     if not snippets:
         return None
 
-    snippet_text = "\n".join(f"- {s}" for s in snippets[:3])
+    snippet_text = "\n".join(f"- {s}" for s in snippets[:2])
     return (
         f"I found a likely direct match in *{best.title}*.\n"
         f"{snippet_text}\n\n"
@@ -665,6 +666,14 @@ def main() -> None:
 
     server = HTTPServer((host, port), SlackHandler)
     print(f"Listening on http://{host}:{port}/slack/command")
+
+    try:
+        print(f"[{BOT_VERSION}] Preloading Notion docs into cache...")
+        CACHE.get_docs()
+        print(f"[{BOT_VERSION}] Cache loaded successfully.")
+    except Exception as err:
+        print(f"[{BOT_VERSION}] Cache preload failed: {err}")
+
     server.serve_forever()
 
 
