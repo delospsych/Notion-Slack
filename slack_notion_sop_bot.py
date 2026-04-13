@@ -13,7 +13,7 @@ No third-party packages are required.
 Required environment variables:
 - SLACK_SIGNING_SECRET
 - NOTION_API_KEY
-- NOTION_PARENT_PAGE_ID
+- NOTION_PARENT_PAGE_IDS   (comma-separated page IDs)
 - OPENAI_API_KEY   (optional; bot can still return closest SOP without AI)
 
 Optional environment variables:
@@ -252,7 +252,8 @@ def collect_page_content_and_children(page_id: str, api_key: str, depth: int = 0
 
 def fetch_notion_docs() -> list[NotionDoc]:
     notion_api_key = required_env("NOTION_API_KEY")
-    parent_page_id = required_env("NOTION_PARENT_PAGE_ID")
+    parent_page_ids_raw = required_env("NOTION_PARENT_PAGE_IDS")
+    parent_page_ids = [x.strip() for x in parent_page_ids_raw.split(",") if x.strip()]
 
     docs: list[NotionDoc] = []
     visited_page_ids: set[str] = set()
@@ -293,7 +294,8 @@ def fetch_notion_docs() -> list[NotionDoc]:
         for child_id in child_page_ids:
             crawl_page(child_id, depth + 1)
 
-    crawl_page(parent_page_id)
+    for parent_page_id in parent_page_ids:
+        crawl_page(parent_page_id)
 
     # Remove parent page itself if it's just a container with almost no content
     filtered_docs = [doc for doc in docs if len(doc.text.strip()) >= 20]
