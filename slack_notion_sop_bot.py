@@ -45,17 +45,15 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 BOT_VERSION = os.getenv("BOT_VERSION", "sop-bot-2026-04-12")
 
-# Speed / retrieval tuning
 CACHE_TTL_SECONDS = 86400
 HTTP_TIMEOUT_SECONDS = 45
 PAGE_RECURSION_DEPTH = 2
 BLOCK_RECURSION_DEPTH = 1
 
-# Chunk retrieval tuning
-CHUNK_TARGET_CHARS = 900
-CHUNK_OVERLAP_LINES = 2
-MAX_CHUNKS_FOR_CONTEXT = 12
-MAX_CHARS_PER_CHUNK = 1400
+CHUNK_TARGET_CHARS = 1200
+CHUNK_OVERLAP_LINES = 3
+MAX_CHUNKS_FOR_CONTEXT = 16
+MAX_CHARS_PER_CHUNK = 1800
 
 
 @dataclass
@@ -436,7 +434,7 @@ def chunk_score(question: str, chunk: Chunk) -> float:
     if question.lower() in chunk.title.lower():
         score += 10.0
 
-    score += SequenceMatcher(None, q, hay[:3000]).ratio() * 6.0
+    score += SequenceMatcher(None, q, hay[:3500]).ratio() * 6.0
     return score
 
 
@@ -465,7 +463,6 @@ def build_context(question: str, chunks: list[Chunk]) -> str:
     for idx, chunk in enumerate(best, start=1):
         context_blocks.append(
             f"[Source {idx}] {chunk.title}\n"
-            f"URL: {chunk.url}\n"
             f"{chunk.text}"
         )
 
@@ -479,10 +476,18 @@ def fallback_answer_without_openai(question: str, chunks: list[Chunk]) -> str:
 
     lines = ["I found these likely relevant SOP excerpts:"]
     for chunk in best:
-        lines.append(f"- *{chunk.title}*: {chunk.text[:300].strip()}...")
-        if chunk.url:
-            lines.append(f"  Source: {chunk.url}")
+        lines.append(f"- {chunk.title}: {chunk.text[:350].strip()}...")
     return "\n".join(lines)
+
+
+def clean_final_answer(text: str) -> str:
+    text = text.replace("**", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"^\s*Sources:\s*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*-\s*\[Source\s+\d+\].*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*\[Source\s+\d+\].*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def openai_answer(question: str, chunks: list[Chunk]) -> str:
@@ -494,15 +499,15 @@ def openai_answer(question: str, chunks: list[Chunk]) -> str:
     context = build_context(question, chunks)
 
     system_prompt = (
-        "You are an internal SOP assistant. Answer ONLY from the provided source excerpts. "
-        "Your job is to extract operational details thoroughly, not to be overly cautious. "
-        "If a list of forms, exclusions, steps, or requirements appears in the excerpts, enumerate all of them clearly. "
-        "Synthesize across multiple sources when needed. "
-        "Be concise but complete. "
-        "Use Slack-friendly markdown. "
-        "Start with the direct answer. "
-        "Then include important nuance or exceptions if present. "
-        "End with a short 'Sources:' section using the source labels like [Source 2]. "
+        "You are an internal SOP assistant. Answer only from the provided source excerpts. "
+        "Extract operational details thoroughly and completely. "
+        "If the excerpts contain lists of forms, exclusions, steps, requirements, rules, exceptions, or edge cases, include them clearly. "
+        "Synthesize across multiple excerpts when needed. "
+        "Do not use bold markdown with double asterisks. "
+        "Do not include a Sources section. "
+        "Do not mention source labels in the final answer unless absolutely necessary. "
+        "Write in plain, clean Slack-friendly text. "
+        "Start with the direct answer, then include relevant nuance or exceptions if present. "
         "If the excerpts are genuinely insufficient, say exactly what is missing."
     )
 
@@ -528,7 +533,7 @@ def openai_answer(question: str, chunks: list[Chunk]) -> str:
 
     direct = response.get("output_text")
     if isinstance(direct, str) and direct.strip():
-        return direct.strip()
+        return clean_final_answer(direct.strip())
 
     chunks_out: list[str] = []
     for item in response.get("output", []):
@@ -544,9 +549,9 @@ def openai_answer(question: str, chunks: list[Chunk]) -> str:
     if not text:
         raw_text = response.get("raw_text")
         if isinstance(raw_text, str) and raw_text.strip():
-            return raw_text.strip()
+            return clean_final_answer(raw_text.strip())
         raise BotError("OpenAI did not return an answer.")
-    return text
+    return clean_final_answer(text)
 
 
 def verify_slack_signature(body: bytes, timestamp: str, signature: str, signing_secret: str) -> bool:
