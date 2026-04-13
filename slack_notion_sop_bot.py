@@ -7,20 +7,6 @@ When a user asks a question in Slack, it:
 2) Crawls one or more parent Notion pages and their child pages.
 3) Retrieves the most relevant SOP snippets.
 4) Uses OpenAI Responses API to generate an answer grounded in those snippets.
-
-No third-party packages are required.
-
-Required environment variables:
-- SLACK_SIGNING_SECRET
-- NOTION_API_KEY
-- NOTION_PARENT_PAGE_IDS   (comma-separated page IDs)
-- OPENAI_API_KEY           (optional; bot can still return closest SOP without AI)
-
-Optional environment variables:
-- OPENAI_MODEL
-- BOT_VERSION
-- HOST
-- PORT
 """
 
 from __future__ import annotations
@@ -32,11 +18,12 @@ import os
 import re
 import threading
 import time
+import socket
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs
 from urllib.request import Request, urlopen
 
@@ -45,11 +32,12 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 BOT_VERSION = os.getenv("BOT_VERSION", "sop-bot-2026-04-12")
 
-CACHE_TTL_SECONDS = 3600
+CACHE_TTL_SECONDS = 21600
 MAX_DOCS_FOR_CONTEXT = 8
 MAX_SNIPPET_CHARS = 2500
-MAX_RECURSION_DEPTH = 5
+MAX_RECURSION_DEPTH = 3
 MAX_DIRECT_HIT_SNIPPETS = 3
+HTTP_TIMEOUT_SECONDS = 90
 
 
 @dataclass
@@ -75,12 +63,12 @@ def required_env(name: str) -> str:
     return value
 
 
-def http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = 30) -> dict[str, Any]:
+def http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
     req_headers = {"Content-Type": "application/json", "User-Agent": "slack-notion-sop-bot/1.0"}
     req_headers.update(headers)
     req = Request(url, data=json.dumps(payload).encode("utf-8"), headers=req_headers, method="POST")
     try:
-        with urlopen(req, timeout=timeout) as resp:  # nosec B310
+        with urlopen(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             body = resp.read().decode(charset).strip()
             if not body:
@@ -92,14 +80,16 @@ def http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], t
     except HTTPError as err:
         body = err.read().decode("utf-8", errors="replace")
         raise BotError(f"POST {url} failed with HTTP {err.code}: {body[:1000]}") from err
+    except (URLError, TimeoutError, socket.timeout) as err:
+        raise BotError(f"POST {url} timed out or failed to connect: {err}") from err
 
 
-def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[str, Any]:
+def http_get_json(url: str, headers: dict[str, str], timeout: int = HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
     req_headers = {"User-Agent": "slack-notion-sop-bot/1.0"}
     req_headers.update(headers)
     req = Request(url, headers=req_headers)
     try:
-        with urlopen(req, timeout=timeout) as resp:  # nosec B310
+        with urlopen(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             body = resp.read().decode(charset).strip()
             if not body:
@@ -111,6 +101,8 @@ def http_get_json(url: str, headers: dict[str, str], timeout: int = 30) -> dict[
     except HTTPError as err:
         body = err.read().decode("utf-8", errors="replace")
         raise BotError(f"GET {url} failed with HTTP {err.code}: {body[:1000]}") from err
+    except (URLError, TimeoutError, socket.timeout) as err:
+        raise BotError(f"GET {url} timed out or failed to connect: {err}") from err
 
 
 def post_slack_response(response_url: str, text: str, response_type: str = "ephemeral") -> None:
@@ -636,7 +628,7 @@ class SlackHandler(BaseHTTPRequestHandler):
                 },
                 status=500,
             )
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             self._respond_json(
                 {
                     "response_type": "ephemeral",
@@ -656,13 +648,13 @@ class SlackHandler(BaseHTTPRequestHandler):
         try:
             answer = self._build_answer(question)
             post_slack_response(response_url, answer)
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             try:
                 post_slack_response(
                     response_url,
                     f"Sorry, I hit an error while searching SOPs: {err}",
                 )
-            except Exception as post_err:  # noqa: BLE001
+            except Exception as post_err:
                 print(f"[{BOT_VERSION}] Failed to post Slack error response: {post_err}")
                 print(f"[{BOT_VERSION}] Original async error: {err}")
 
